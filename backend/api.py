@@ -425,11 +425,11 @@ import traceback
 # Import our modules
 from backend.preprocessing import EEGPreprocessor
 from backend.features import EEGFeatureExtractor
-from embedding import EEGEmbedding
-from model_transformer import EEGTransformer, save_model, load_model
-from trainer import EEGTrainer, EEGDataset
-from explainers import EEGExplainer
+from backend.model_transformer import EEGTransformer, save_model, load_model
+from backend.trainer import EEGTrainer, EEGDataset
+from backend.explainers import EEGExplainer
 from backend.plots import EEGPlotter
+
 
 # Initialize FastAPI
 app = FastAPI(

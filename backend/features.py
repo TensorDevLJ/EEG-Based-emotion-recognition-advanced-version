@@ -2,7 +2,7 @@
 EEG Feature Extraction Module
 Extracts spectral, temporal, and connectivity features
 """
-
+from typing import Optional, Tuple, Dict, List
 import numpy as np
 from scipy import signal
 from scipy.stats import skew, kurtosis
