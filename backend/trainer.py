@@ -1,6 +1,6 @@
 """
-Training Pipeline for EEG Transformer Model
-Supports LOSO cross-validation, metrics tracking, callbacks
+Training Pipeline for Transformer Model
+Supports standard train/val/test split and Leave-One-Subject-Out (LOSO)
 """
 
 import torch
@@ -8,146 +8,99 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support, confusion_matrix, roc_auc_score, roc_curve
-from sklearn.model_selection import LeaveOneGroupOut
-from typing import Dict, List, Tuple, Optional, Callable
-import json
-from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support, confusion_matrix
 import time
+from tqdm import tqdm
 
 
 class EEGDataset(Dataset):
-    """PyTorch Dataset for EEG sequences"""
+    """PyTorch Dataset for EEG features"""
+    def __init__(self, features, labels):
+        self.features = torch.FloatTensor(features)
+        self.labels = torch.LongTensor(labels)
     
-    def __init__(self, X: np.ndarray, y: np.ndarray, subjects: Optional[np.ndarray] = None):
-        """
-        X: (n_samples, seq_len, feature_dim)
-        y: (n_samples,) class labels
-        subjects: (n_samples,) subject IDs for LOSO
-        """
-        self.X = torch.FloatTensor(X)
-        self.y = torch.LongTensor(y)
-        self.subjects = subjects
-        
     def __len__(self):
-        return len(self.X)
+        return len(self.labels)
     
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        return self.features[idx], self.labels[idx]
 
 
-class EarlyStopping:
-    """Early stopping callback"""
-    
-    def __init__(self, patience: int = 10, min_delta: float = 0.0, mode: str = 'min'):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        
-    def __call__(self, score: float) -> bool:
-        if self.best_score is None:
-            self.best_score = score
-            return False
-        
-        if self.mode == 'min':
-            improved = score < (self.best_score - self.min_delta)
-        else:
-            improved = score > (self.best_score + self.min_delta)
-        
-        if improved:
-            self.best_score = score
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        
-        return self.early_stop
+def collate_fn(batch):
+    """Custom collate function for variable length sequences"""
+    features, labels = zip(*batch)
+    features = torch.stack(features)
+    labels = torch.stack(labels)
+    return features, labels
 
 
-class ModelCheckpoint:
-    """Save best model callback"""
-    
-    def __init__(self, filepath: str, mode: str = 'min', save_best_only: bool = True):
-        self.filepath = filepath
-        self.mode = mode
-        self.save_best_only = save_best_only
-        self.best_score = None
-        
-    def __call__(self, model: nn.Module, score: float, epoch: int):
-        if not self.save_best_only:
-            torch.save(model.state_dict(), f"{self.filepath}_epoch{epoch}.pth")
-            return
-        
-        if self.best_score is None:
-            self.best_score = score
-            torch.save(model.state_dict(), self.filepath)
-            return
-        
-        if self.mode == 'min':
-            improved = score < self.best_score
-        else:
-            improved = score > self.best_score
-        
-        if improved:
-            self.best_score = score
-            torch.save(model.state_dict(), self.filepath)
-
-
-class EEGTrainer:
-    """Complete training pipeline"""
-    
-    def __init__(self, model: nn.Module, device: str = 'cpu'):
-        self.model = model
+class Trainer:
+    """Trainer class for EEG Transformer"""
+    def __init__(
+        self,
+        model,
+        device='cpu',
+        lr=1e-4,
+        weight_decay=1e-5,
+        patience=10
+    ):
+        self.model = model.to(device)
         self.device = device
-        self.model.to(device)
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.criterion = nn.CrossEntropyLoss()
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=patience//2, factor=0.5
+        )
+        self.patience = patience
+        
         self.history = {
             'train_loss': [],
             'train_acc': [],
-            'train_f1': [],
             'val_loss': [],
             'val_acc': [],
+            'train_f1': [],
             'val_f1': []
         }
-        
-    def train_epoch(self, dataloader: DataLoader, optimizer: optim.Optimizer, 
-                   criterion: nn.Module) -> Tuple[float, float, float]:
+    
+    def train_epoch(self, train_loader):
         """Train for one epoch"""
         self.model.train()
         total_loss = 0
         all_preds = []
         all_labels = []
         
-        for batch_X, batch_y in dataloader:
-            batch_X = batch_X.to(self.device)
-            batch_y = batch_y.to(self.device)
+        for features, labels in train_loader:
+            features = features.to(self.device)
+            labels = labels.to(self.device)
             
             # Forward
-            optimizer.zero_grad()
-            outputs = self.model(batch_X)
-            loss = criterion(outputs, batch_y)
+            self.optimizer.zero_grad()
+            
+            # Reshape for transformer: (seq_len=1, batch, features)
+            features = features.unsqueeze(0)
+            logits, _ = self.model(features)
+            
+            loss = self.criterion(logits, labels)
             
             # Backward
             loss.backward()
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
             
             total_loss += loss.item()
             
-            # Predictions
-            preds = torch.argmax(outputs, dim=1)
+            preds = torch.argmax(logits, dim=1)
             all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch_y.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
         
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / len(train_loader)
         acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='macro')
         
         return avg_loss, acc, f1
     
-    def validate(self, dataloader: DataLoader, criterion: nn.Module) -> Tuple[float, float, float]:
+    def validate(self, val_loader):
         """Validate model"""
         self.model.eval()
         total_loss = 0
@@ -155,203 +108,144 @@ class EEGTrainer:
         all_labels = []
         
         with torch.no_grad():
-            for batch_X, batch_y in dataloader:
-                batch_X = batch_X.to(self.device)
-                batch_y = batch_y.to(self.device)
+            for features, labels in val_loader:
+                features = features.to(self.device)
+                labels = labels.to(self.device)
                 
-                outputs = self.model(batch_X)
-                loss = criterion(outputs, batch_y)
+                features = features.unsqueeze(0)
+                logits, _ = self.model(features)
                 
+                loss = self.criterion(logits, labels)
                 total_loss += loss.item()
                 
-                preds = torch.argmax(outputs, dim=1)
+                preds = torch.argmax(logits, dim=1)
                 all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(batch_y.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
         
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / len(val_loader)
         acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='macro')
         
-        return avg_loss, acc, f1
+        return avg_loss, acc, f1, all_preds, all_labels
     
-    def train(self, train_dataset: EEGDataset, val_dataset: Optional[EEGDataset],
-             epochs: int = 50, batch_size: int = 16, lr: float = 1e-4,
-             weight_decay: float = 1e-5, patience: int = 10,
-             save_path: Optional[str] = None) -> Dict:
-        """
-        Full training loop with callbacks
-        """
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size) if val_dataset else None
-        
-        optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = nn.CrossEntropyLoss()
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
-        
-        early_stopping = EarlyStopping(patience=patience, mode='min')
-        if save_path:
-            checkpoint = ModelCheckpoint(save_path, mode='min')
+    def train(self, train_loader, val_loader, epochs=50, save_path='saved_models/best_model.pth'):
+        """Complete training loop"""
+        best_val_f1 = 0
+        patience_counter = 0
         
         print(f"Training for {epochs} epochs...")
-        start_time = time.time()
         
         for epoch in range(epochs):
-            # Train
-            train_loss, train_acc, train_f1 = self.train_epoch(train_loader, optimizer, criterion)
+            start_time = time.time()
             
-            self.history['train_loss'].append(train_loss)
-            self.history['train_acc'].append(train_acc)
-            self.history['train_f1'].append(train_f1)
+            # Train
+            train_loss, train_acc, train_f1 = self.train_epoch(train_loader)
             
             # Validate
-            if val_loader:
-                val_loss, val_acc, val_f1 = self.validate(val_loader, criterion)
-                self.history['val_loss'].append(val_loss)
-                self.history['val_acc'].append(val_acc)
-                self.history['val_f1'].append(val_f1)
-                
-                scheduler.step(val_loss)
-                
-                print(f"Epoch {epoch+1}/{epochs} - "
-                      f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, train_f1: {train_f1:.4f} - "
-                      f"val_loss: {val_loss:.4f}, val_acc: {val_acc:.4f}, val_f1: {val_f1:.4f}")
-                
-                # Callbacks
-                if save_path:
-                    checkpoint(self.model, val_loss, epoch)
-                
-                if early_stopping(val_loss):
-                    print(f"Early stopping at epoch {epoch+1}")
-                    break
+            val_loss, val_acc, val_f1, _, _ = self.validate(val_loader)
+            
+            # Update scheduler
+            self.scheduler.step(val_loss)
+            
+            # Store history
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_acc'].append(val_acc)
+            self.history['train_f1'].append(train_f1)
+            self.history['val_f1'].append(val_f1)
+            
+            # Early stopping
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                torch.save(self.model.state_dict(), save_path)
+                patience_counter = 0
             else:
-                print(f"Epoch {epoch+1}/{epochs} - "
-                      f"train_loss: {train_loss:.4f}, train_acc: {train_acc:.4f}, train_f1: {train_f1:.4f}")
+                patience_counter += 1
+            
+            epoch_time = time.time() - start_time
+            
+            print(f"Epoch {epoch+1}/{epochs} ({epoch_time:.2f}s) - "
+                  f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Train F1: {train_f1:.4f} | "
+                  f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}")
+            
+            if patience_counter >= self.patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
         
-        training_time = time.time() - start_time
-        print(f"Training completed in {training_time:.2f}s")
+        # Load best model
+        self.model.load_state_dict(torch.load(save_path))
+        print(f"Training complete. Best val F1: {best_val_f1:.4f}")
         
-        return {
-            'history': self.history,
-            'training_time': training_time,
-            'epochs_trained': epoch + 1
-        }
-    
-    def evaluate(self, test_dataset: EEGDataset, 
-                class_names: List[str] = None) -> Dict:
-        """
-        Comprehensive evaluation on test set
-        """
-        test_loader = DataLoader(test_dataset, batch_size=32)
-        
-        self.model.eval()
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        
-        with torch.no_grad():
-            for batch_X, batch_y in test_loader:
-                batch_X = batch_X.to(self.device)
-                
-                outputs = self.model(batch_X)
-                probs = torch.softmax(outputs, dim=1)
-                preds = torch.argmax(outputs, dim=1)
-                
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(batch_y.numpy())
-                all_probs.extend(probs.cpu().numpy())
-        
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        all_probs = np.array(all_probs)
-        
-        # Metrics
-        acc = accuracy_score(all_labels, all_preds)
-        f1_macro = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        precision, recall, f1_per_class, support = precision_recall_fscore_support(
-            all_labels, all_preds, zero_division=0
-        )
-        cm = confusion_matrix(all_labels, all_preds)
-        
-        # ROC AUC (one-vs-rest)
-        n_classes = len(np.unique(all_labels))
-        if n_classes > 2:
-            try:
-                roc_auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
-            except:
-                roc_auc = None
-        else:
-            try:
-                roc_auc = roc_auc_score(all_labels, all_probs[:, 1])
-            except:
-                roc_auc = None
-        
-        results = {
-            'accuracy': float(acc),
-            'f1_macro': float(f1_macro),
-            'precision_per_class': precision.tolist(),
-            'recall_per_class': recall.tolist(),
-            'f1_per_class': f1_per_class.tolist(),
-            'support': support.tolist(),
-            'confusion_matrix': cm.tolist(),
-            'roc_auc_macro': float(roc_auc) if roc_auc else None,
-            'predictions': all_preds.tolist(),
-            'labels': all_labels.tolist(),
-            'probabilities': all_probs.tolist()
-        }
-        
-        if class_names:
-            results['class_names'] = class_names
-        
-        return results
+        return self.history
 
 
-def cross_validate_loso(model_class, X: np.ndarray, y: np.ndarray, 
-                       subjects: np.ndarray, **train_kwargs) -> Dict:
-    """
-    Leave-One-Subject-Out cross-validation
-    """
-    logo = LeaveOneGroupOut()
-    fold_results = []
+def evaluate(model, test_loader, device='cpu'):
+    """Evaluate model on test set"""
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
     
-    for fold_idx, (train_idx, test_idx) in enumerate(logo.split(X, y, subjects)):
-        print(f"\n=== LOSO Fold {fold_idx + 1} ===")
-        print(f"Test subject: {subjects[test_idx[0]]}")
-        
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-        
-        # Split train into train/val
-        n_val = int(len(X_train) * 0.1)
-        val_idx = np.random.choice(len(X_train), n_val, replace=False)
-        train_mask = np.ones(len(X_train), dtype=bool)
-        train_mask[val_idx] = False
-        
-        X_tr, X_val = X_train[train_mask], X_train[val_idx]
-        y_tr, y_val = y_train[train_mask], y_train[val_idx]
-        
-        # Create datasets
-        train_ds = EEGDataset(X_tr, y_tr)
-        val_ds = EEGDataset(X_val, y_val)
-        test_ds = EEGDataset(X_test, y_test)
-        
-        # Initialize model
-        model = model_class()
-        trainer = EEGTrainer(model)
-        
-        # Train
-        trainer.train(train_ds, val_ds, **train_kwargs)
-        
-        # Evaluate
-        results = trainer.evaluate(test_ds)
-        fold_results.append(results)
+    with torch.no_grad():
+        for features, labels in test_loader:
+            features = features.to(device)
+            labels = labels.to(device)
+            
+            features = features.unsqueeze(0)
+            logits, _ = model(features)
+            probs = torch.softmax(logits, dim=1)
+            
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
     
-    # Aggregate results
-    avg_acc = np.mean([r['accuracy'] for r in fold_results])
-    avg_f1 = np.mean([r['f1_macro'] for r in fold_results])
+    # Metrics
+    acc = accuracy_score(all_labels, all_preds)
+    f1_macro = f1_score(all_labels, all_preds, average='macro')
+    precision, recall, f1_per_class, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average=None
+    )
+    cm = confusion_matrix(all_labels, all_preds)
     
-    return {
-        'fold_results': fold_results,
-        'average_accuracy': float(avg_acc),
-        'average_f1_macro': float(avg_f1),
-        'n_folds': len(fold_results)
+    metrics = {
+        'accuracy': acc,
+        'f1_macro': f1_macro,
+        'precision_per_class': precision.tolist(),
+        'recall_per_class': recall.tolist(),
+        'f1_per_class': f1_per_class.tolist(),
+        'confusion_matrix': cm.tolist(),
+        'predictions': all_preds,
+        'labels': all_labels,
+        'probabilities': all_probs
     }
+    
+    print(f"Test Accuracy: {acc:.4f}")
+    print(f"Test F1 (macro): {f1_macro:.4f}")
+    
+    return metrics
+
+
+def prepare_data_loaders(features, labels, batch_size=32, test_size=0.2, val_size=0.1):
+    """Prepare train/val/test data loaders"""
+    # Split
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        features, labels, test_size=test_size+val_size, random_state=42, stratify=labels
+    )
+    
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=test_size/(test_size+val_size), random_state=42, stratify=y_temp
+    )
+    
+    # Datasets
+    train_dataset = EEGDataset(X_train, y_train)
+    val_dataset = EEGDataset(X_val, y_val)
+    test_dataset = EEGDataset(X_test, y_test)
+    
+    # Loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, val_loader, test_loader
