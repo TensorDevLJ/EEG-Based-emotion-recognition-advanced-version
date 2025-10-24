@@ -11,30 +11,20 @@ import torch
 import io
 from typing import Dict, Any
 
+from contextlib import asynccontextmanager
+
 from model_transformer import EEGTransformer, load_model
 from features import preprocess_features, compute_depression_index
 from plots import generate_all_graphs
 from explainers import generate_explanations, get_shap_values
-
-app = FastAPI(title="EEG Depression Detection API")
-
-# CORS for frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:8080/"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Global model and scaler
 MODEL = None
 SCALER = None
 FEATURE_STATS = None
 
-@app.on_event("startup")
-async def load_models():
-    """Load trained model and scaler on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global MODEL, SCALER, FEATURE_STATS
     try:
         MODEL, metadata = load_model('saved_models/best_model.pth')
@@ -48,6 +38,18 @@ async def load_models():
         MODEL.eval()
         SCALER = None
         FEATURE_STATS = {}
+    yield
+
+app = FastAPI(title="EEG Depression Detection API", lifespan=lifespan)
+
+# CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
